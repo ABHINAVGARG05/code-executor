@@ -1,0 +1,41 @@
+services:
+  api-gateway:
+    build:
+      context: .
+      dockerfile: api-gateway/Dockerfile
+    environment:
+      - AWS_REGION=${AWS_REGION}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - DYNAMODB_TABLE=${DYNAMODB_TABLE}
+      - CODE_EXEC_BUCKET=${CODE_EXEC_BUCKET}
+      - SQS_QUEUE_URL=${SQS_QUEUE_URL}
+    ports:
+      - "8080:8080"
+    depends_on:
+      - executor-go
+      - executor-cpp
+  executor-go:
+    build:
+      context: .
+      dockerfile: executor-go/Dockerfile
+    environment:
+      - AWS_REGION=${AWS_REGION}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - DYNAMODB_TABLE=${DYNAMODB_TABLE}
+      - CODE_EXEC_BUCKET=${CODE_EXEC_BUCKET}
+      - SQS_QUEUE_URL=${SQS_QUEUE_URL}
+      - EXEC_TIMEOUT_SEC=10
+  executor-cpp:
+    build:
+      context: .
+      dockerfile: executor-cpp/Dockerfile
+    environment:
+      - AWS_REGION=${AWS_REGION}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - DYNAMODB_TABLE=${DYNAMODB_TABLE}
+      - CODE_EXEC_BUCKET=${CODE_EXEC_BUCKET}
+      - SQS_QUEUE_URL=${SQS_QUEUE_URL}
+      - EXEC_TIMEOUT_SEC=10
