@@ -2,8 +2,8 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/ABHINAVGARG05/rme/aws/shared/config"
+	"github.com/ABHINAVGARG05/rme/aws/shared/languages"
 	"github.com/ABHINAVGARG05/rme/aws/shared/models"
 	"github.com/ABHINAVGARG05/rme/aws/shared/queue"
 	"github.com/ABHINAVGARG05/rme/aws/shared/store"
@@ -21,6 +22,7 @@ type SubmitDeps struct {
 	Env *config.Env
 	DDB *dynamodb.Client
 	SQS *sqs.Client
+	LangResolver languages.Resolver
 }
 
 type submitReq struct {
@@ -44,14 +46,9 @@ func HandleSubmit(deps SubmitDeps) http.HandlerFunc {
 			return
 		}
 
-		req.Language = strings.ToLower(strings.TrimSpace(req.Language))
-		switch req.Language {
-		case "go", "golang":
-			req.Language = "go"
-		case "cpp", "c++":
-			req.Language = "cpp"
-		default:
-			http.Error(w, "unsupported language", http.StatusBadRequest)
+		req.Language = deps.LangResolver.Normalize(req.Language)
+		if req.Language == "" {
+			http.Error(w, fmt.Sprintf("unsupported language; supported=%v", deps.LangResolver.Supported()), http.StatusBadRequest)
 			return
 		}
 

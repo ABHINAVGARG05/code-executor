@@ -119,6 +119,45 @@ If execution exceeds `EXEC_TIMEOUT_SEC`, status becomes `timeout` and error fiel
 - Persistent logs & metrics (CloudWatch / OpenTelemetry).
 - Websocket / SSE for real-time status updates.
 
+## Adding a New Language (Pure Dependency Injection)
+
+Language support is configured explicitly where the API server is built (see `api-gateway/server.go`). There is no implicit default resolver; you must list every supported language when constructing the resolver.
+
+Steps:
+
+1. Edit `api-gateway/server.go` and locate the `languages.NewResolver([...])` call. Add a new entry to the slice:
+
+```go
+langResolver: languages.NewResolver([]languages.Language{
+  {Name: "go",  Aliases: []string{"golang"}, DisplayName: "Go"},
+  {Name: "cpp", Aliases: []string{"c++"},   DisplayName: "C++"},
+  {Name: "python", Aliases: []string{"py"}, DisplayName: "Python"}, // <--- added
+})
+```
+
+2. (Optional but recommended) If you need shared normalization data, you can create a helper in `shared/languages` (e.g. a function returning the slice) and reference it from `server.go` to avoid duplication across tests.
+
+3. Create a new executor service directory (e.g. `executor-python`) modeled after `executor-go` / `executor-cpp`:
+
+   - Poll SQS messages.
+   - Skip messages whose `language` does not match `python`.
+   - Write user code to a temp file (e.g. `main.py`).
+   - Execute with a timeout (`python3 main.py`).
+   - Combine stdout + stderr, upload to S3, update DynamoDB (status + preview) exactly like other executors.
+
+4. Add a Dockerfile for the new executor (Python base image) and extend `docker-compose.yml` with a new service referencing it (mounting env vars identical to other executors).
+
+5. Rebuild and start:
+
+```bash
+docker compose build executor-python api-gateway
+docker compose up -d executor-python
+```
+
+6. Submit jobs with `"language": "python"` (aliases like `py` will normalize to `python`).
+
+Because construction is explicit, you can feature‑flag or dynamically construct the slice (e.g. from a config file) before passing it to `languages.NewResolver`. If you later remove a language from the slice, the API will start rejecting it immediately with a 400 (unsupported language).
+
 ## Cleanup & Costs
 
 Ensure you delete S3 objects and DynamoDB items for test jobs to control costs in real AWS.

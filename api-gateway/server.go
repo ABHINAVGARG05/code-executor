@@ -6,11 +6,11 @@ import (
 
 	"github.com/ABHINAVGARG05/rme/aws/api-gateway/handlers"
 	"github.com/ABHINAVGARG05/rme/aws/shared/config"
-
+	"github.com/ABHINAVGARG05/rme/aws/shared/languages"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	"github.com/aws/aws-sdk-go-v2/service/s3"	
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 )
 
@@ -21,6 +21,7 @@ type Server struct {
 	ddb       *dynamodb.Client
 	s3        *s3.Client
 	presigner *s3.PresignClient
+	langResolver languages.Resolver
 }
 
 func NewServer() *Server {
@@ -31,12 +32,16 @@ func NewServer() *Server {
 	s3Client := s3.NewFromConfig(awsCfg)
 
 	return &Server{
-		env:       &env,
-		awsCfg:    awsCfg,
-		sqs:       sqs.NewFromConfig(awsCfg),
-		ddb:       dynamodb.NewFromConfig(awsCfg),
-		s3:        s3Client,
-		presigner: s3.NewPresignClient(s3Client),
+		env:          &env,
+		awsCfg:       awsCfg,
+		sqs:          sqs.NewFromConfig(awsCfg),
+		ddb:          dynamodb.NewFromConfig(awsCfg),
+		s3:           s3Client,
+		presigner:    s3.NewPresignClient(s3Client),
+		langResolver: languages.NewResolver([]languages.Language{
+			{Name: "go", Aliases: []string{"golang"}, DisplayName: "Go"},
+			{Name: "cpp", Aliases: []string{"c++"}, DisplayName: "C++"},
+		}),
 	}
 }
 
@@ -47,9 +52,10 @@ func (s *Server) routes() {
 	})
 
 	http.HandleFunc("/submit", handlers.HandleSubmit(handlers.SubmitDeps{
-		Env: s.env,
-		DDB: s.ddb,
-		SQS: s.sqs,
+		Env:          s.env,
+		DDB:          s.ddb,
+		SQS:          s.sqs,
+		LangResolver: s.langResolver,
 	}))
 
 	http.HandleFunc("/status", handlers.HandleStatus(handlers.StatusDeps{
