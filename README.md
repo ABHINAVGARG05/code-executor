@@ -1,4 +1,4 @@
-# Remote Code Execution Microservices (Go + C++)
+  x# Remote Code Execution Microservices (Go + C++)
 
 This project provides a minimal microservice architecture for remote code execution supporting Go and C++.
 
@@ -165,8 +165,8 @@ Each user code submission executes inside its own **ephemeral Docker container**
 | **Image** | Minimal (Go: `golang:alpine`, C++: `alpine`+`g++`) | Small attack surface |
 | **Cleanup** | `AutoRemove=true` | Container is deleted immediately after exit |
 | **Runtime (optional)** | `SANDBOX_RUNTIME=runsc` | gVisor intercepts all syscalls with a userspace kernel |
-| **Orchestrator user** | Executor runs as `root` (no `USER` in executor Dockerfile) | Required to access `/var/run/docker.sock` (mode 660, owned `root:docker`). Mitigated by `cap_drop: ALL` + `no-new-privileges` on the executor container. |
-| **Docker socket** | `/var/run/docker.sock` mounted `:ro` in executor | The `:ro` flag only protects the socket file — any process with access can issue **any** Docker API call (create privileged containers, mount host paths, etc.). This gives the executor process root-equivalent host access. The per-job sandbox containers do **not** have the socket. See [Threat Model](#threat-model) item 1 for mitigation. |
+| **Orchestrator user** | Executor runs as `root` (no `USER` in executor Dockerfile) | Mitigated by `cap_drop: ALL` + `no-new-privileges`. The executor connects to Docker via a scoped proxy, not the raw daemon socket. |
+| **Docker access** | `DOCKER_HOST=tcp://docker-socket-proxy:2375` — scoped proxy gives read-only socket to proxy, executors connect over TCP | Executors can only call container-related endpoints (`containers/create`, `start`, `attach`, `wait`, `kill`, `remove`) and `version`. No access to images, networks, volumes, exec, build, or privileged container creation. The proxy has `privileged: false` and the real socket is `:ro` even for the proxy. |
 
 ### gVisor Integration
 
@@ -189,8 +189,7 @@ When `SANDBOX_RUNTIME` is set, all per-job sandbox containers run under gVisor's
 
 This sandboxing is appropriate for executing **untrusted user code** in a multi-tenant environment. The primary risks that remain:
 
-1. **Docker socket equivalent root**: The executor container has `/var/run/docker.sock` (read-only mount) to create per-job sandbox containers. While the `:ro` flag prevents modifying the socket file, any process with access to this socket can issue any Docker API call — including creating privileged containers with host mounts. This means the **executor process itself** has effectively root-equivalent access to the host. The per-job sandbox containers do **not** have the socket mounted, but the executor orchestrator runs as `root` (required for socket access) with `cap_drop: ALL` and `no-new-privileges:true` as defense-in-depth.
-   - **Mitigation**: Deploy a [docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy) that whitelists only the API endpoints needed (`/containers/create`, `/containers/{id}/start`, `/containers/{id}/attach`, `/containers/{id}/wait`, `/containers/{id}/logs`, `/containers/{id}/kill`, `/containers/{id}/remove`). Then mount the proxy's socket instead of the Docker daemon socket.
+1. **Docker socket equivalent root**: The executor connects to Docker via a [docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy) that whitelists only container and version endpoints. The real socket is mounted `:ro` into the proxy (not the executor), and the proxy runs with `privileged: false`. This prevents the executor from creating privileged containers, accessing images/networks/volumes, or performing any Docker API operation outside the whitelist. The per-job sandbox containers have no Docker access at all.
 
 2. **Output size**: A malicious program can produce gigabytes of output, consuming executor memory. Mitigation: output is buffered in the executor process (256MB memory limit helps contain this).
 
@@ -202,7 +201,6 @@ This sandboxing is appropriate for executing **untrusted user code** in a multi-
 
 ## Future Enhancements
 
-- **Docker socket proxy**: Replace direct Docker socket mount with [docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy) to whitelist only the required API endpoints, removing the executor's root-equivalent host access.
 - LocalStack docker-compose integration.
 - Per-language SQS queues / SNS fan-out.
 - Rate limiting & auth (API keys / JWT).
@@ -264,8 +262,7 @@ executor-python:
   environment:
     ... (same env vars as other executors)
     - SANDBOX_IMAGE=code-exec-sandbox-python:latest
-  volumes:
-    - /var/run/docker.sock:/var/run/docker.sock:ro
+    - DOCKER_HOST=tcp://docker-socket-proxy:2375
   security_opt:
     - no-new-privileges:true
   cap_drop:
@@ -302,10 +299,11 @@ flowchart TB
     GW["API Gateway<br/>:8080"]
     DDB[("DynamoDB<br/>Jobs Table")]
     Q[("SQS Queue")]
+    PROXY["docker-socket-proxy<br/>scoped: containers + version"]
+    DOCKER((Docker Daemon))
 
     subgraph exec-go ["executor-go"]
         EG[Poll SQS<br/>Filter: lang=go]
-        SG[("Sandbox Image<br/>code-exec-sandbox-go")]
         direction TB
         subgraph go-sandbox ["Per-Job Ephemeral Container"]
             GOSB[("
@@ -328,7 +326,6 @@ flowchart TB
 
     subgraph exec-cpp ["executor-cpp"]
         EC[Poll SQS<br/>Filter: lang=cpp]
-        SC[("Sandbox Image<br/>code-exec-sandbox-cpp")]
         subgraph cpp-sandbox ["Per-Job Ephemeral Container"]
             CPPSB[("
                 --cap-drop=ALL
@@ -359,11 +356,14 @@ flowchart TB
     Q -- Poll --> EC
 
     EG -- Fetch job --> DDB
+    EG -- tcp://proxy:2375 --> PROXY
+    PROXY -- :ro socket --> DOCKER
     EG -- Create & run --> go-sandbox
     EG -- Upload output --> S3
     EG -- Update status --> DDB
 
     EC -- Fetch job --> DDB
+    EC -- tcp://proxy:2375 --> PROXY
     EC -- Create & run --> cpp-sandbox
     EC -- Upload output --> S3
     EC -- Update status --> DDB
@@ -379,12 +379,11 @@ flowchart TB
     style DDB fill:#f5a623,color:#000
     style Q fill:#7ed321,color:#000
     style S3 fill:#d0021b,color:#fff
+    style PROXY fill:#9b59b6,color:#fff
     style go-sandbox fill:#e8f5e9,stroke:#2e7d32
     style cpp-sandbox fill:#e8f5e9,stroke:#2e7d32
     style exec-go fill:#e3f2fd,stroke:#1565c0
     style exec-cpp fill:#e3f2fd,stroke:#1565c0
-    style SG fill:#c8e6c9,stroke:#2e7d32
-    style SC fill:#c8e6c9,stroke:#2e7d32
 ```
 
 ## Troubleshooting
@@ -393,7 +392,7 @@ flowchart TB
 - Missing outputPath: verify S3 bucket exists & permissions.
 - Timeout quickly: adjust `EXEC_TIMEOUT_SEC`.
 - Docker build issues: ensure relative `shared` module path matches build context.
-- `Cannot connect to the Docker daemon` in executor logs: the Docker socket is not mounted or inaccessible. Ensure `/var/run/docker.sock` exists on the host and is mounted in docker-compose. The executor runs as `root` inside its container (required for socket access), so file-level permissions are not an issue — but if you switch to a non-root user, you must also match the socket's GID (typically `docker` group) or use `chmod` on the socket mount.
+- `Cannot connect to the Docker daemon` in executor logs: the docker-socket-proxy may not be running or the Docker host socket is inaccessible. Check `docker compose logs docker-socket-proxy`. Ensure `/var/run/docker.sock` exists on the host and is mounted into the proxy service.
 - `Container create failed: image not found`: the sandbox image was not built. Run `make sandbox-images` or `docker compose build sandbox-go sandbox-cpp`.
 - Sandbox containers not being cleaned up: they should auto-remove on exit. If an executor crashes mid-job, the `defer ContainerRemove` (with `Force: true`) ensures cleanup.
 
