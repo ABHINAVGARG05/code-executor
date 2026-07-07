@@ -165,7 +165,7 @@ Each user code submission executes inside its own **ephemeral Docker container**
 | **Image** | Minimal (Go: `golang:alpine`, C++: `alpine`+`g++`) | Small attack surface |
 | **Cleanup** | `AutoRemove=true` | Container is deleted immediately after exit |
 | **Runtime (optional)** | `SANDBOX_RUNTIME=runsc` | gVisor intercepts all syscalls with a userspace kernel |
-| **Orchestrator user** | Executor runs as `root` (no `USER` in executor Dockerfile) | Mitigated by `cap_drop: ALL` + `no-new-privileges`. The executor connects to Docker via a scoped proxy, not the raw daemon socket. |
+| **Orchestrator user** | Executor runs as `root` (no `USER` in executor Dockerfile) | The socket itself is the privilege boundary — once a process can reach `/var/run/docker.sock`, container-level restrictions like `cap_drop` and `no-new-privileges` are not effective. The executor connects to Docker via a scoped proxy, not the raw daemon socket. |
 | **Docker access** | `DOCKER_HOST=tcp://docker-socket-proxy:2375` — scoped proxy gives read-only socket to proxy, executors connect over TCP | Executors can only call container-related endpoints (`containers/create`, `start`, `attach`, `wait`, `kill`, `remove`) and `version`. No access to images, networks, volumes, exec, build, or privileged container creation. The proxy has `privileged: false` and the real socket is `:ro` even for the proxy. |
 
 ### gVisor Integration
@@ -392,9 +392,9 @@ flowchart TB
 - Missing outputPath: verify S3 bucket exists & permissions.
 - Timeout quickly: adjust `EXEC_TIMEOUT_SEC`.
 - Docker build issues: ensure relative `shared` module path matches build context.
-- `Cannot connect to the Docker daemon` in executor logs: the docker-socket-proxy may not be running or the Docker host socket is inaccessible. Check `docker compose logs docker-socket-proxy`. Ensure `/var/run/docker.sock` exists on the host and is mounted into the proxy service.
+- `Cannot connect to the Docker daemon` in executor logs: the docker-socket-proxy may not be running or the Docker host socket is inaccessible. Check `docker compose logs docker-socket-proxy`. Ensure `/var/run/docker.sock` exists on the host and is mounted into the proxy service. The proxy container runs as non-root and requires its GID to match the host's `docker` group GID; do not change socket permissions as a workaround.
 - `Container create failed: image not found`: the sandbox image was not built. Run `make sandbox-images` or `docker compose build sandbox-go sandbox-cpp`.
-- Sandbox containers not being cleaned up: they should auto-remove on exit. If an executor crashes mid-job, the `defer ContainerRemove` (with `Force: true`) ensures cleanup.
+- Sandbox containers not being cleaned up: containers use `AutoRemove=true` and are removed on normal exit. If an executor crashes, deferred cleanup does not run; orphaned containers rely on Docker's own daemon-level reaping or an external reaper mechanism.
 
 ---
 
