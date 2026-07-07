@@ -260,9 +260,6 @@ executor-python:
   build:
     context: .
     dockerfile: executor-python/Dockerfile
-  depends_on:
-    sandbox-python:
-      condition: service_completed_successfully
   image: code-executor-python:latest
   environment:
     ... (same env vars as other executors)
