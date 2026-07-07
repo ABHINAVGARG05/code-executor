@@ -5,18 +5,20 @@ This project provides a minimal microservice architecture for remote code execut
 ## Components
 
 - **api-gateway**: Accepts submissions, exposes status/result endpoints.
-- **executor-go**: Consumes SQS messages for Go jobs, runs `go run` inside container, uploads output to S3, updates DynamoDB.
-- **executor-cpp**: Consumes SQS messages for C++ jobs, compiles with `g++ -std=c++17 -O2`, runs, uploads output to S3, updates DynamoDB.
+- **executor-go**: Polls SQS for Go jobs, spawns an ephemeral Docker container per job with full sandbox isolation, captures output, uploads to S3, updates DynamoDB.
+- **executor-cpp**: Same pattern as executor-go but for C++ (compiles with `g++ -std=c++17 -O2` inside the sandbox container).
 - **shared**: Common models, config, store (DynamoDB helpers), and queue helpers.
+- **sandbox-images/**: Minimal Docker images (`code-exec-sandbox-go`, `code-exec-sandbox-cpp`) with a non-root `sandbox` user — used by executors as the base for per-job containers.
 
 ## Data Flow
 
 1. Client POSTs `/submit` with `{ userId, language: go|cpp, code, input }`.
 2. `api-gateway` stores job (status=queued) in DynamoDB and pushes minimal message `{executionId, language}` to SQS.
 3. Appropriate executor polls SQS, fetches job from DynamoDB, marks `running`.
-4. Code executed with timeout (`EXEC_TIMEOUT_SEC`, default 10s). Output + stderr combined -> S3 object `outputs/<executionId>.txt`.
-5. DynamoDB updated with `status` (completed|failed|timeout), `outputPath`, `stdoutPreview`, timestamps, and error if any.
-6. Client polls `/status?id=<executionId>` or requests `/result?id=<executionId>` for a presigned URL + preview.
+4. Executor creates an **ephemeral Docker container** with the user's code copied in, executes it under sandbox constraints (see [Sandboxing Layer](#sandboxing-layer)), captures stdout/stderr.
+5. Output uploaded to S3 as `outputs/<executionId>.txt`, DynamoDB updated with status, preview, metadata.
+6. The ephemeral container is **auto-removed**.
+7. Client polls `/status?id=<executionId>` or requests `/result?id=<executionId>` for a presigned URL + preview.
 
 ## DynamoDB Item Fields
 
@@ -36,25 +38,39 @@ This project provides a minimal microservice architecture for remote code execut
 
 ## Environment Variables
 
-Set these for every service (compose passes through):
+Set these via a `.env` file or exported in the shell (compose passes through):
 
-- `AWS_REGION`
-- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (dummy acceptable for LocalStack)
-- `DYNAMODB_TABLE`
-- `CODE_EXEC_BUCKET`
-- `SQS_QUEUE_URL`
-- `EXEC_TIMEOUT_SEC` (executors only, optional)
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `AWS_REGION` | Yes | — | AWS region |
+| `AWS_ACCESS_KEY_ID` | Yes | — | AWS access key (dummy for LocalStack) |
+| `AWS_SECRET_ACCESS_KEY` | Yes | — | AWS secret key (dummy for LocalStack) |
+| `DYNAMODB_TABLE` | Yes | — | DynamoDB job table name |
+| `CODE_EXEC_BUCKET` | Yes | — | S3 bucket for execution outputs |
+| `SQS_QUEUE_URL` | Yes | — | SQS queue URL |
+| `EXEC_TIMEOUT_SEC` | No | `10` | Max seconds per job |
+| `SANDBOX_IMAGE` | No | `code-exec-sandbox-{lang}:latest` | Sandbox image for the executor |
+| `SANDBOX_RUNTIME` | No | (Docker default) | Runtime to use for sandbox containers: empty = `runc`, `runsc` = gVisor |
 
 ## Local Development
-
-You can use real AWS resources or LocalStack (not yet wired here—future enhancement).
 
 ### Build & Run (Docker Compose)
 
 ```bash
-# Ensure env vars exported or placed in a .env file for docker-compose
-docker compose build
-docker compose up -d
+# 1. Ensure env vars exported or placed in a .env file
+# 2. Build sandbox images first, then services, then start
+make
+# Or manually:
+#   docker compose build sandbox-go sandbox-cpp
+#   docker compose build
+#   docker compose up -d
+
+# View logs
+docker compose logs -f executor-go
+docker compose logs -f executor-cpp
+
+# Stop everything
+make down
 ```
 
 ### Submit a Job
@@ -92,6 +108,33 @@ curl "http://localhost:8080/result?id=<executionId>"
 
 Returns JSON with `url` and `stdoutPreview`.
 
+## Frontend (Next.js)
+
+A simple, nice web UI is included under `frontend/` (Next.js + TypeScript + Tailwind + Monaco editor).
+
+Features:
+
+- Language selector (Go, C++) with starter templates
+- Monaco editor with dark theme
+- Stdin input box and userId field
+- Submit job, auto-poll status, show stdout preview
+- Download full output via presigned S3 URL
+
+The frontend proxies `/api/*` requests to `http://localhost:8080/*` during development (see `frontend/next.config.mjs`), avoiding CORS issues.
+
+### Run the frontend
+
+Prereqs: Node.js 18+ and pnpm/npm installed.
+
+```bash
+cd frontend
+npm install
+npm run dev
+# open http://localhost:3000
+```
+
+Make sure the backend is running on `http://localhost:8080` (via `docker compose up -d`) so the UI can submit and poll jobs.
+
 ## C++ Example
 
 ```bash
@@ -102,13 +145,52 @@ curl -X POST http://localhost:8080/submit \
 
 ## Timeout Handling
 
-If execution exceeds `EXEC_TIMEOUT_SEC`, status becomes `timeout` and error field contains a message.
+If execution exceeds `EXEC_TIMEOUT_SEC`, the sandbox container is killed with SIGKILL and status becomes `timeout`.
 
-## Security Notes (Further Hardening Needed)
+## Sandboxing Layer
 
-- Current containers run arbitrary code with full process privileges of container.
-- Recommended enhancements: cgroup CPU/mem limits, seccomp profiles, gVisor/Firecracker isolation, restrict network egress, sanitize code size.
-- Consider separate per-job ephemeral containers instead of in-process `go run` / compiled binary reuse.
+Each user code submission executes inside its own **ephemeral Docker container** with the following restrictions:
+
+| Layer | Setting | What it prevents |
+|---|---|---|
+| **Capabilities** | `--cap-drop=ALL` | No privilege escalation (`CAP_SYS_ADMIN`, `CAP_NET_RAW`, `CAP_SYS_PTRACE`, etc.) |
+| **Privilege escalation** | `--security-opt no-new-privileges:true` | No setuid/setgid binary exploitation |
+| **Network** | `--network=none` | No outbound connections, no data exfiltration, no crypto mining |
+| **Filesystem** | `--read-only` + tmpfs `/tmp` (64MB, noexec, nosuid) | Cannot modify filesystem; scratch space is RAM-only and limited |
+| **Memory** | 256MB limit, no swap | Fork bombs and memory exhaustion are contained |
+| **CPU** | 1 core limit | CPU-bound loops cannot starve other jobs |
+| **Processes** | Max 64 PIDs | Fork bombs are limited |
+| **User** | Non-root `sandbox` (UID 1000) | No root access inside container |
+| **Credentials** | No AWS env vars in sandbox | Even a container escape yields no cloud credentials |
+| **Image** | Minimal (Go: `golang:alpine`, C++: `alpine`+`g++`) | Small attack surface |
+| **Cleanup** | `AutoRemove=true` | Container is deleted immediately after exit |
+| **Runtime (optional)** | `SANDBOX_RUNTIME=runsc` | gVisor intercepts all syscalls with a userspace kernel |
+
+### gVisor Integration
+
+For syscall-level sandboxing (the same approach Google Colab uses), install gVisor on the host and set `SANDBOX_RUNTIME=runsc`:
+
+```bash
+# On the Docker host (Linux only):
+#   https://gvisor.dev/docs/user_guide/install/
+sudo apt install runsc
+sudo runsc install
+sudo systemctl restart docker
+
+# Then in docker-compose.override.yml or .env:
+# SANDBOX_RUNTIME=runsc
+```
+
+When `SANDBOX_RUNTIME` is set, all per-job sandbox containers run under gVisor's `runsc` OCI runtime, which provides a user-space kernel that intercepts and mediates every syscall. This protects against kernel-level exploits even if the container isolation is bypassed.
+
+### Threat Model
+
+This sandboxing is appropriate for executing **untrusted user code** in a multi-tenant environment. The primary risks that remain:
+
+1. **Output size**: A malicious program can produce gigabytes of output, consuming executor memory. Mitigation: output is buffered in the executor process (256MB memory limit helps contain this).
+2. **Side-channel attacks**: Timing attacks and cache-based information leaks across sandbox containers sharing a CPU core.
+3. **Docker daemon vulnerabilities**: If the Docker daemon itself is compromised, all sandboxes are compromised. Keeping Docker updated mitigates this.
+4. **gVisor coverage**: Some syscalls are not fully intercepted by gVisor; check [gVisor compatibility](https://gvisor.dev/docs/user_guide/compatibility/) for details.
 
 ## Future Enhancements
 
@@ -137,24 +219,68 @@ langResolver: languages.NewResolver([]languages.Language{
 
 2. (Optional but recommended) If you need shared normalization data, you can create a helper in `shared/languages` (e.g. a function returning the slice) and reference it from `server.go` to avoid duplication across tests.
 
-3. Create a new executor service directory (e.g. `executor-python`) modeled after `executor-go` / `executor-cpp`:
+3. Create a sandbox image (`sandbox-images/python/Dockerfile`) with a `sandbox` non-root user and the Python runtime:
 
-   - Poll SQS messages.
-   - Skip messages whose `language` does not match `python`.
-   - Write user code to a temp file (e.g. `main.py`).
-   - Execute with a timeout (`python3 main.py`).
-   - Combine stdout + stderr, upload to S3, update DynamoDB (status + preview) exactly like other executors.
+```dockerfile
+FROM python:3.12-alpine
+RUN adduser -D -u 1000 sandbox
+USER sandbox
+WORKDIR /home/sandbox
+```
 
-4. Add a Dockerfile for the new executor (Python base image) and extend `docker-compose.yml` with a new service referencing it (mounting env vars identical to other executors).
+4. Add the sandbox build to `docker-compose.yml` and `depends_on`:
 
-5. Rebuild and start:
+```yaml
+sandbox-python:
+  image: code-exec-sandbox-python:latest
+  build:
+    context: .
+    dockerfile: sandbox-images/python/Dockerfile
+  profiles: ["build"]
+```
+
+5. Create `executor-python/main.go` modeled after `executor-go/main.go`:
+   - Use `code-exec-sandbox-python:latest` as the sandbox image
+   - Command: `sh -c "cat > /tmp/main.py && python3 /tmp/main.py"`
+   - Same Docker SDK sandbox container config (cap drop, no network, resource limits, etc.)
+
+6. Add to `docker-compose.yml`:
+
+```yaml
+executor-python:
+  build:
+    context: .
+    dockerfile: executor-python/Dockerfile
+  depends_on:
+    sandbox-python:
+      condition: service_completed_successfully
+  image: code-executor-python:latest
+  environment:
+    ... (same env vars as other executors)
+    - SANDBOX_IMAGE=code-exec-sandbox-python:latest
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock:ro
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  mem_limit: 256m
+  cpu: 1
+  restart: unless-stopped
+```
+
+7. Rebuild and start:
 
 ```bash
-docker compose build executor-python api-gateway
+# Build sandbox image first
+docker compose build sandbox-python
+# Build executor
+docker compose build executor-python
+# Start
 docker compose up -d executor-python
 ```
 
-6. Submit jobs with `"language": "python"` (aliases like `py` will normalize to `python`).
+8. Submit jobs with `"language": "python"` (aliases like `py` will normalize to `python`).
 
 Because construction is explicit, you can feature‑flag or dynamically construct the slice (e.g. from a config file) before passing it to `languages.NewResolver`. If you later remove a language from the slice, the API will start rejecting it immediately with a 400 (unsupported language).
 
@@ -167,8 +293,28 @@ Ensure you delete S3 objects and DynamoDB items for test jobs to control costs i
 ```
 Client -> API Gateway -> DynamoDB (create item)
                     |-> SQS (enqueue {id,lang})
-SQS -> executor-go (filter lang=go) -> fetch item -> run -> S3 upload -> DynamoDB update
-SQS -> executor-cpp (filter lang=cpp) -> fetch item -> run -> S3 upload -> DynamoDB update
+
+SQS -> executor-go (filter lang=go) -> fetch item
+  |
+  +---> Docker: Create ephemeral sandbox container
+  |       - code-exec-sandbox-go:latest
+  |       - --cap-drop=ALL
+  |       - --network=none
+  |       - --read-only + tmpfs /tmp
+  |       - --memory=256m --cpus=1 --pids-limit=64
+  |       - no-new-privileges
+  |       - user: sandbox
+  |
+  +---> Copy code via Docker API archive
+  +---> Attach stdin (user input) / stdout+stderr
+  +---> Wait for exit or timeout -> kill
+  +---> Capture output -> S3 upload -> DynamoDB update
+  +---> Container auto-removed
+
+SQS -> executor-cpp (filter lang=cpp) -> same pattern
+  |
+  +---> Sandbox: compile g++ -std=c++17 -> execute -> output
+
 Client -> /status -> DynamoDB
 Client -> /result -> DynamoDB -> (presign) S3
 ```
@@ -179,6 +325,9 @@ Client -> /result -> DynamoDB -> (presign) S3
 - Missing outputPath: verify S3 bucket exists & permissions.
 - Timeout quickly: adjust `EXEC_TIMEOUT_SEC`.
 - Docker build issues: ensure relative `shared` module path matches build context.
+- `Cannot connect to the Docker daemon` in executor logs: the Docker socket is not mounted. Ensure `/var/run/docker.sock` is available on the host and mounted in docker-compose.
+- `Container create failed: image not found`: the sandbox image was not built. Run `make sandbox-images` or `docker compose build sandbox-go sandbox-cpp`.
+- Sandbox containers not being cleaned up: they should auto-remove on exit. If an executor crashes mid-job, the `defer ContainerRemove` (with `Force: true`) ensures cleanup.
 
 ---
 
