@@ -13,18 +13,20 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	sqst "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 
+	"github.com/ABHINAVGARG05/rme/aws/shared/config"
 	"github.com/ABHINAVGARG05/rme/aws/shared/store"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 )
+
+const maxOutputBytes = 10 * 1024 * 1024
 
 type jobMsg struct {
 	ExecutionID string `json:"executionId"`
@@ -34,10 +36,7 @@ type jobMsg struct {
 func main() {
 	ctx := context.Background()
 
-	region := os.Getenv("AWS_REGION")
-	queueURL := os.Getenv("SQS_QUEUE_URL")
-	table := os.Getenv("DYNAMODB_TABLE")
-	bucket := os.Getenv("CODE_EXEC_BUCKET")
+	env := config.MustEnv()
 	sandboxImage := os.Getenv("SANDBOX_IMAGE")
 	if sandboxImage == "" {
 		sandboxImage = "code-exec-sandbox-go:latest"
@@ -47,19 +46,21 @@ func main() {
 		fmt.Sscanf(v, "%d", &timeoutSec)
 	}
 
-	if region == "" || queueURL == "" || table == "" || bucket == "" {
+	if env.AWSRegion == "" || env.SQSQueueURL == "" || env.DynamoDBTable == "" || env.CodeExecBucket == "" {
 		log.Fatal("missing required env vars")
 	}
 
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
-	if err != nil {
-		log.Fatal(err)
-	}
+	awsCfg := config.LoadAWSConfig(ctx, env.AWSRegion, env.AWSEndpoint)
 
-	sqsClient := sqs.NewFromConfig(cfg)
-	ddb := dynamodb.NewFromConfig(cfg)
-	s3c := s3.NewFromConfig(cfg)
-	uploader := manager.NewUploader(s3c)
+	s3Client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		if env.UseLocalStack() {
+			o.UsePathStyle = true
+		}
+	})
+	uploader := manager.NewUploader(s3Client)
+
+	sqsClient := sqs.NewFromConfig(awsCfg)
+	ddb := dynamodb.NewFromConfig(awsCfg)
 
 	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
@@ -70,7 +71,7 @@ func main() {
 
 	for {
 		msgsOut, err := sqsClient.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
-			QueueUrl:            aws.String(queueURL),
+			QueueUrl:            aws.String(env.SQSQueueURL),
 			MaxNumberOfMessages: 5,
 			WaitTimeSeconds:     10,
 			VisibilityTimeout:   int32(timeoutSec + 15),
@@ -88,17 +89,17 @@ func main() {
 			var jm jobMsg
 			if err := json.Unmarshal([]byte(aws.ToString(m.Body)), &jm); err != nil {
 				log.Printf("bad message: %v", err)
-				deleteMessage(ctx, sqsClient, queueURL, m)
+				deleteMessage(ctx, sqsClient, env.SQSQueueURL, m)
 				continue
 			}
 			if jm.Language != "go" {
 				continue
 			}
 			go func(m sqst.Message, jm jobMsg) {
-				if err := processJob(ctx, ddb, uploader, dockerClient, table, bucket, sandboxImage, jm, timeoutSec); err != nil {
+				if err := processJob(ctx, ddb, uploader, dockerClient, env.DynamoDBTable, env.CodeExecBucket, sandboxImage, jm, timeoutSec); err != nil {
 					log.Printf("job %s failed: %v", jm.ExecutionID, err)
 				}
-				deleteMessage(ctx, sqsClient, queueURL, m)
+				deleteMessage(ctx, sqsClient, env.SQSQueueURL, m)
 			}(m, jm)
 		}
 	}
@@ -205,7 +206,8 @@ func processJob(
 	var outputBuf bytes.Buffer
 	outputDone := make(chan error, 1)
 	go func() {
-		_, err := io.Copy(&outputBuf, attach.Reader)
+		limited := io.LimitReader(attach.Reader, maxOutputBytes)
+		_, err := io.Copy(&outputBuf, limited)
 		outputDone <- err
 	}()
 
@@ -216,6 +218,7 @@ func processJob(
 
 	var statusCode int64
 	var timedOut bool
+	var outputTruncated bool
 	select {
 	case <-waitCtx.Done():
 		timedOut = true
@@ -229,6 +232,10 @@ func processJob(
 	}
 
 	<-outputDone
+
+	if outputBuf.Len() == maxOutputBytes {
+		outputTruncated = true
+	}
 
 	durationMs := time.Since(start).Milliseconds()
 
@@ -249,11 +256,17 @@ func processJob(
 		status = "failed"
 		extra["error"] = truncate(stderrStr, 2000)
 	}
+	if outputTruncated {
+		extra["truncated"] = true
+	}
 
 	key := fmt.Sprintf("outputs/%s.txt", jm.ExecutionID)
 	uploadBody := stdoutStr
 	if stderrStr != "" {
 		uploadBody += "\n[stderr]\n" + stderrStr
+	}
+	if outputTruncated {
+		uploadBody += "\n\n[output truncated at 10MB]"
 	}
 	if _, err := uploader.Upload(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(bucket),

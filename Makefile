@@ -10,9 +10,13 @@ sandbox-images:
 build: sandbox-images
 	docker compose build
 
-# Start all services
+# Start all services (LocalStack auto-provisions DynamoDB, S3, SQS)
 up:
 	docker compose up -d
+
+# Start without LocalStack (connect to real AWS instead)
+up-aws:
+	AWS_ENDPOINT_URL="" docker compose up -d
 
 # Stop all services
 down:
@@ -21,3 +25,7 @@ down:
 # Full cleanup
 clean: down
 	docker compose down -v --rmi all
+
+# View executor logs
+logs:
+	docker compose logs -f executor-go executor-cpp

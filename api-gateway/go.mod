@@ -6,6 +6,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.50.3
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.87.2
 	github.com/google/uuid v1.6.0
+	golang.org/x/time v0.15.0
 )
 
 require (

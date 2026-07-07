@@ -36,18 +36,36 @@ This project provides a minimal microservice architecture for remote code execut
 | createdAt / updatedAt / startedAt / completedAt | Timestamps (RFC3339)                      |
 | execDurationMs                                  | Milliseconds runtime (excludes S3 upload) |
 
+## Output Size Limit
+
+Execution output is capped at **10MB** per job. If a program produces more output, it is truncated and a `[output truncated at 10MB]` marker is appended. The job status will include `"truncated": true`. This prevents runaway output from exhausting executor memory.
+
+## Rate Limiting
+
+The API gateway limits requests to **10 per second per IP** with a burst of 20. Exceeding this returns HTTP 429. The rate limiter uses a token bucket backed by `golang.org/x/time/rate`.
+
+## LocalStack
+
+By default, the entire stack runs against [LocalStack](https://localstack.cloud/) — no real AWS account needed. The `localstack` service provides DynamoDB, S3, and SQS, automatically provisioned on startup via `scripts/localstack-init.sh`.
+
+To use real AWS instead:
+```bash
+AWS_ENDPOINT_URL="" docker compose up -d
+```
+
 ## Environment Variables
 
 Set these via a `.env` file or exported in the shell (compose passes through):
 
 | Variable | Required | Default | Description |
-|---|---|---|---|
-| `AWS_REGION` | Yes | — | AWS region |
-| `AWS_ACCESS_KEY_ID` | Yes | — | AWS access key (dummy for LocalStack) |
-| `AWS_SECRET_ACCESS_KEY` | Yes | — | AWS secret key (dummy for LocalStack) |
-| `DYNAMODB_TABLE` | Yes | — | DynamoDB job table name |
-| `CODE_EXEC_BUCKET` | Yes | — | S3 bucket for execution outputs |
-| `SQS_QUEUE_URL` | Yes | — | SQS queue URL |
+|---|---|---|---|---|
+| `AWS_REGION` | No | `us-east-1` | AWS region |
+| `AWS_ACCESS_KEY_ID` | No | `fake` | AWS access key (dummy for LocalStack) |
+| `AWS_SECRET_ACCESS_KEY` | No | `fake` | AWS secret key (dummy for LocalStack) |
+| `AWS_ENDPOINT_URL` | No | `http://localstack:4566` | AWS endpoint override; set to `""` to use real AWS |
+| `DYNAMODB_TABLE` | No | `code-exec-jobs` | DynamoDB job table name |
+| `CODE_EXEC_BUCKET` | No | `code-exec-outputs` | S3 bucket for execution outputs |
+| `SQS_QUEUE_URL` | No | `http://localstack:4566/000000000000/code-exec-queue` | SQS queue URL |
 | `EXEC_TIMEOUT_SEC` | No | `10` | Max seconds per job |
 | `SANDBOX_IMAGE` | No | `code-exec-sandbox-{lang}:latest` | Sandbox image for the executor |
 | `SANDBOX_RUNTIME` | No | (Docker default) | Runtime to use for sandbox containers: empty = `runc`, `runsc` = gVisor |
@@ -65,6 +83,10 @@ make
 #   docker compose build
 #   docker compose up -d
 
+# Everything starts with LocalStack by default (no real AWS needed)
+# To use real AWS instead, set AWS_ENDPOINT_URL="" and real credentials:
+#   AWS_ENDPOINT_URL="" docker compose up -d
+
 # View logs
 docker compose logs -f executor-go
 docker compose logs -f executor-cpp
@@ -73,12 +95,22 @@ docker compose logs -f executor-cpp
 make down
 ```
 
-### Submit a Job
+### Submit a Job (local dev with LocalStack)
 
 ```bash
 curl -X POST http://localhost:8080/submit \
   -H 'Content-Type: application/json' \
-  -d '{"userId":"u1","language":"go","code":"package main\nimport (\n\t\"fmt\"\n)\nfunc main(){fmt.Println(\"hi\")}","input":""}'
+  -d '{"userId":"u1","language":"go","code":"package main\nimport \"fmt\"\nfunc main(){fmt.Println(\"hi\")}","input":""}'
+```
+
+### Submit a Job
+
+The examples below work against LocalStack (`make up`). To use real AWS, set `AWS_ENDPOINT_URL=""` and configure credentials.
+
+```bash
+curl -X POST http://localhost:8080/submit \
+  -H 'Content-Type: application/json' \
+  -d '{"userId":"u1","language":"go","code":"package main\nimport \"fmt\"\nfunc main(){fmt.Println(\"hi\")}","input":""}'
 ```
 
 Response:
@@ -140,7 +172,7 @@ Make sure the backend is running on `http://localhost:8080` (via `docker compose
 ```bash
 curl -X POST http://localhost:8080/submit \
   -H 'Content-Type: application/json' \
-  -d '{"userId":"u1","language":"cpp","code":"#include <bits/stdc++.h>\nusing namespace std; int main(){string s; if(!(cin>>s)) return 0; cout<<s<<\\n;}","input":"hello"}'
+  -d '{"userId":"u1","language":"cpp","code":"#include <bits/stdc++.h>\nusing namespace std; int main(){string s; if(!(cin>>s)) return 0; cout<<s<<\"\\n\";}","input":"hello"}'
 ```
 
 ## Timeout Handling

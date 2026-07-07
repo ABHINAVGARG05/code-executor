@@ -26,19 +26,60 @@ services:
       dockerfile: sandbox-images/cpp/Dockerfile
     profiles: ["build"]
 
+  # Local AWS emulator for fully local development
+  localstack:
+    image: localstack/localstack:latest
+    environment:
+      - SERVICES=dynamodb,s3,sqs
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=fake
+      - AWS_SECRET_ACCESS_KEY=fake
+      - DATA_DIR=/tmp/localstack/data
+      - SKIP_INFRA_DOWNLOADS=1
+    ports:
+      - "4566:4566"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    mem_limit: 512m
+    restart: unless-stopped
+
+  # Provision DynamoDB table, S3 bucket, and SQS queue on startup
+  localstack-init:
+    image: amazon/aws-cli:latest
+    environment:
+      - AWS_ACCESS_KEY_ID=fake
+      - AWS_SECRET_ACCESS_KEY=fake
+      - AWS_DEFAULT_REGION=us-east-1
+    volumes:
+      - ./scripts:/scripts:ro
+    entrypoint: ["/bin/sh", "/scripts/localstack-init.sh"]
+    depends_on:
+      localstack:
+        condition: service_healthy
+    mem_limit: 64m
+    profiles: ["local"]
+
   api-gateway:
     build:
       context: .
       dockerfile: api-gateway/Dockerfile
     environment:
-      - AWS_REGION=${AWS_REGION}
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - DYNAMODB_TABLE=${DYNAMODB_TABLE}
-      - CODE_EXEC_BUCKET=${CODE_EXEC_BUCKET}
-      - SQS_QUEUE_URL=${SQS_QUEUE_URL}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-fake}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-fake}
+      - AWS_ENDPOINT_URL=${AWS_ENDPOINT_URL:-http://localstack:4566}
+      - DYNAMODB_TABLE=${DYNAMODB_TABLE:-code-exec-jobs}
+      - CODE_EXEC_BUCKET=${CODE_EXEC_BUCKET:-code-exec-outputs}
+      - SQS_QUEUE_URL=${SQS_QUEUE_URL:-http://localstack:4566/000000000000/code-exec-queue}
     ports:
       - "8080:8080"
+    depends_on:
+      localstack-init:
+        condition: service_completed_successfully
+        required: false
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -57,13 +98,17 @@ services:
     image: code-executor-go:latest
     depends_on:
       - docker-socket-proxy
+      localstack-init:
+        condition: service_completed_successfully
+        required: false
     environment:
-      - AWS_REGION=${AWS_REGION}
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - DYNAMODB_TABLE=${DYNAMODB_TABLE}
-      - CODE_EXEC_BUCKET=${CODE_EXEC_BUCKET}
-      - SQS_QUEUE_URL=${SQS_QUEUE_URL}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-fake}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-fake}
+      - AWS_ENDPOINT_URL=${AWS_ENDPOINT_URL:-http://localstack:4566}
+      - DYNAMODB_TABLE=${DYNAMODB_TABLE:-code-exec-jobs}
+      - CODE_EXEC_BUCKET=${CODE_EXEC_BUCKET:-code-exec-outputs}
+      - SQS_QUEUE_URL=${SQS_QUEUE_URL:-http://localstack:4566/000000000000/code-exec-queue}
       - EXEC_TIMEOUT_SEC=10
       - SANDBOX_IMAGE=code-exec-sandbox-go:latest
       - DOCKER_HOST=tcp://docker-socket-proxy:2375
@@ -82,13 +127,17 @@ services:
     image: code-executor-cpp:latest
     depends_on:
       - docker-socket-proxy
+      localstack-init:
+        condition: service_completed_successfully
+        required: false
     environment:
-      - AWS_REGION=${AWS_REGION}
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - DYNAMODB_TABLE=${DYNAMODB_TABLE}
-      - CODE_EXEC_BUCKET=${CODE_EXEC_BUCKET}
-      - SQS_QUEUE_URL=${SQS_QUEUE_URL}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-fake}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-fake}
+      - AWS_ENDPOINT_URL=${AWS_ENDPOINT_URL:-http://localstack:4566}
+      - DYNAMODB_TABLE=${DYNAMODB_TABLE:-code-exec-jobs}
+      - CODE_EXEC_BUCKET=${CODE_EXEC_BUCKET:-code-exec-outputs}
+      - SQS_QUEUE_URL=${SQS_QUEUE_URL:-http://localstack:4566/000000000000/code-exec-queue}
       - EXEC_TIMEOUT_SEC=10
       - SANDBOX_IMAGE=code-exec-sandbox-cpp:latest
       - DOCKER_HOST=tcp://docker-socket-proxy:2375

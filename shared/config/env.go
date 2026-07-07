@@ -2,20 +2,19 @@ package config
 
 import (
 	"log"
+	"os"
 
 	"github.com/joho/godotenv"
-	"os"
 )
 
 type Env struct {
-	AWSRegion       string
-	AWSAccessKey    string
-	AWSSecretKey    string
-	CodeExecBucket  string
-	DynamoDBTable   string
-	LambdaFunction  string
-	APIGatewayURL   string
-	SQSQueueURL     string
+	AWSRegion      string
+	AWSAccessKey   string
+	AWSSecretKey   string
+	AWSEndpoint    string
+	CodeExecBucket string
+	DynamoDBTable  string
+	SQSQueueURL    string
 }
 
 func MustEnv() Env {
@@ -24,13 +23,16 @@ func MustEnv() Env {
 	}
 
 	return Env{
-		AWSRegion:       os.Getenv("AWS_REGION"),
-		AWSAccessKey:    os.Getenv("AWS_ACCESS_KEY_ID"),
-		AWSSecretKey:    os.Getenv("AWS_SECRET_ACCESS_KEY"),
-		CodeExecBucket:  os.Getenv("CODE_EXEC_BUCKET"),
-		DynamoDBTable:   os.Getenv("DYNAMODB_TABLE"),
-		LambdaFunction:  os.Getenv("LAMBDA_FUNCTION"),
-		APIGatewayURL:   os.Getenv("API_GATEWAY_URL"),
-		SQSQueueURL:     os.Getenv("SQS_QUEUE_URL"),
+		AWSRegion:      os.Getenv("AWS_REGION"),
+		AWSAccessKey:   os.Getenv("AWS_ACCESS_KEY_ID"),
+		AWSSecretKey:   os.Getenv("AWS_SECRET_ACCESS_KEY"),
+		AWSEndpoint:    os.Getenv("AWS_ENDPOINT_URL"),
+		CodeExecBucket: os.Getenv("CODE_EXEC_BUCKET"),
+		DynamoDBTable:  os.Getenv("DYNAMODB_TABLE"),
+		SQSQueueURL:    os.Getenv("SQS_QUEUE_URL"),
 	}
+}
+
+func (e *Env) UseLocalStack() bool {
+	return e.AWSEndpoint != ""
 }
