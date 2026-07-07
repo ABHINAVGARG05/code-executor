@@ -187,13 +187,20 @@ When `SANDBOX_RUNTIME` is set, all per-job sandbox containers run under gVisor's
 
 This sandboxing is appropriate for executing **untrusted user code** in a multi-tenant environment. The primary risks that remain:
 
-1. **Output size**: A malicious program can produce gigabytes of output, consuming executor memory. Mitigation: output is buffered in the executor process (256MB memory limit helps contain this).
-2. **Side-channel attacks**: Timing attacks and cache-based information leaks across sandbox containers sharing a CPU core.
-3. **Docker daemon vulnerabilities**: If the Docker daemon itself is compromised, all sandboxes are compromised. Keeping Docker updated mitigates this.
-4. **gVisor coverage**: Some syscalls are not fully intercepted by gVisor; check [gVisor compatibility](https://gvisor.dev/docs/user_guide/compatibility/) for details.
+1. **Docker socket equivalent root**: The executor container has `/var/run/docker.sock` (read-only mount) to create per-job sandbox containers. While the `:ro` flag prevents modifying the socket file, any process with access to this socket can issue any Docker API call — including creating privileged containers with host mounts. This means the **executor process itself** has effectively root-equivalent access to the host. The per-job sandbox containers do **not** have the socket mounted, but the executor orchestrator runs as `root` (required for socket access) with `cap_drop: ALL` and `no-new-privileges:true` as defense-in-depth.
+   - **Mitigation**: Deploy a [docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy) that whitelists only the API endpoints needed (`/containers/create`, `/containers/{id}/start`, `/containers/{id}/attach`, `/containers/{id}/wait`, `/containers/{id}/logs`, `/containers/{id}/kill`, `/containers/{id}/remove`). Then mount the proxy's socket instead of the Docker daemon socket.
+
+2. **Output size**: A malicious program can produce gigabytes of output, consuming executor memory. Mitigation: output is buffered in the executor process (256MB memory limit helps contain this).
+
+3. **Side-channel attacks**: Timing attacks and cache-based information leaks across sandbox containers sharing a CPU core.
+
+4. **Docker daemon vulnerabilities**: If the Docker daemon itself is compromised, all sandboxes are compromised. Keeping Docker updated mitigates this.
+
+5. **gVisor coverage**: Some syscalls are not fully intercepted by gVisor; check [gVisor compatibility](https://gvisor.dev/docs/user_guide/compatibility/) for details.
 
 ## Future Enhancements
 
+- **Docker socket proxy**: Replace direct Docker socket mount with [docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy) to whitelist only the required API endpoints, removing the executor's root-equivalent host access.
 - LocalStack docker-compose integration.
 - Per-language SQS queues / SNS fan-out.
 - Rate limiting & auth (API keys / JWT).
@@ -387,7 +394,7 @@ flowchart TB
 - Missing outputPath: verify S3 bucket exists & permissions.
 - Timeout quickly: adjust `EXEC_TIMEOUT_SEC`.
 - Docker build issues: ensure relative `shared` module path matches build context.
-- `Cannot connect to the Docker daemon` in executor logs: the Docker socket is not mounted. Ensure `/var/run/docker.sock` is available on the host and mounted in docker-compose.
+- `Cannot connect to the Docker daemon` in executor logs: the Docker socket is not mounted or inaccessible. Ensure `/var/run/docker.sock` exists on the host and is mounted in docker-compose. The executor runs as `root` inside its container (required for socket access), so file-level permissions are not an issue — but if you switch to a non-root user, you must also match the socket's GID (typically `docker` group) or use `chmod` on the socket mount.
 - `Container create failed: image not found`: the sandbox image was not built. Run `make sandbox-images` or `docker compose build sandbox-go sandbox-cpp`.
 - Sandbox containers not being cleaned up: they should auto-remove on exit. If an executor crashes mid-job, the `defer ContainerRemove` (with `Force: true`) ensures cleanup.
 
