@@ -165,6 +165,8 @@ Each user code submission executes inside its own **ephemeral Docker container**
 | **Image** | Minimal (Go: `golang:alpine`, C++: `alpine`+`g++`) | Small attack surface |
 | **Cleanup** | `AutoRemove=true` | Container is deleted immediately after exit |
 | **Runtime (optional)** | `SANDBOX_RUNTIME=runsc` | gVisor intercepts all syscalls with a userspace kernel |
+| **Orchestrator user** | Executor runs as `root` (no `USER` in executor Dockerfile) | Required to access `/var/run/docker.sock` (mode 660, owned `root:docker`). Mitigated by `cap_drop: ALL` + `no-new-privileges` on the executor container. |
+| **Docker socket** | `/var/run/docker.sock` mounted `:ro` in executor | The `:ro` flag only protects the socket file — any process with access can issue **any** Docker API call (create privileged containers, mount host paths, etc.). This gives the executor process root-equivalent host access. The per-job sandbox containers do **not** have the socket. See [Threat Model](#threat-model) item 1 for mitigation. |
 
 ### gVisor Integration
 
