@@ -288,35 +288,97 @@ Because construction is explicit, you can feature‑flag or dynamically construc
 
 Ensure you delete S3 objects and DynamoDB items for test jobs to control costs in real AWS.
 
-## Architecture Diagram (Text)
+## Architecture Diagram
 
-```
-Client -> API Gateway -> DynamoDB (create item)
-                    |-> SQS (enqueue {id,lang})
+```mermaid
+flowchart TB
+    Client(["Client (curl / Next.js)"])
+    GW["API Gateway<br/>:8080"]
+    DDB[("DynamoDB<br/>Jobs Table")]
+    Q[("SQS Queue")]
 
-SQS -> executor-go (filter lang=go) -> fetch item
-  |
-  +---> Docker: Create ephemeral sandbox container
-  |       - code-exec-sandbox-go:latest
-  |       - --cap-drop=ALL
-  |       - --network=none
-  |       - --read-only + tmpfs /tmp
-  |       - --memory=256m --cpus=1 --pids-limit=64
-  |       - no-new-privileges
-  |       - user: sandbox
-  |
-  +---> Copy code via Docker API archive
-  +---> Attach stdin (user input) / stdout+stderr
-  +---> Wait for exit or timeout -> kill
-  +---> Capture output -> S3 upload -> DynamoDB update
-  +---> Container auto-removed
+    subgraph exec-go ["executor-go"]
+        EG[Poll SQS<br/>Filter: lang=go]
+        SG[("Sandbox Image<br/>code-exec-sandbox-go")]
+        direction TB
+        subgraph go-sandbox ["Per-Job Ephemeral Container"]
+            GOSB[("
+                --cap-drop=ALL
+                --network=none
+                --read-only + tmpfs
+                --memory=256m --cpus=1
+                no-new-privileges
+                user: sandbox
+            ")]
+            GORUN[("
+                1. Copy main.go via tar
+                2. Attach stdin
+                3. go run /tmp/main.go
+                4. Capture stdout/stderr
+                5. Container auto-removed
+            ")]
+        end
+    end
 
-SQS -> executor-cpp (filter lang=cpp) -> same pattern
-  |
-  +---> Sandbox: compile g++ -std=c++17 -> execute -> output
+    subgraph exec-cpp ["executor-cpp"]
+        EC[Poll SQS<br/>Filter: lang=cpp]
+        SC[("Sandbox Image<br/>code-exec-sandbox-cpp")]
+        subgraph cpp-sandbox ["Per-Job Ephemeral Container"]
+            CPPSB[("
+                --cap-drop=ALL
+                --network=none
+                --read-only + tmpfs
+                --memory=256m --cpus=1
+                no-new-privileges
+                user: sandbox
+            ")]
+            CPPRUN[("
+                1. Copy main.cpp via tar
+                2. Attach stdin
+                3. g++ -std=c++17 -O2
+                4. Execute binary
+                5. Capture stdout/stderr
+                6. Container auto-removed
+            ")]
+        end
+    end
 
-Client -> /status -> DynamoDB
-Client -> /result -> DynamoDB -> (presign) S3
+    S3[(S3 Bucket<br/>outputs/*.txt)]
+
+    Client -- POST /submit --> GW
+    GW -- Create job --> DDB
+    GW -- Enqueue {id, lang} --> Q
+
+    Q -- Poll --> EG
+    Q -- Poll --> EC
+
+    EG -- Fetch job --> DDB
+    EG -- Create & run --> go-sandbox
+    EG -- Upload output --> S3
+    EG -- Update status --> DDB
+
+    EC -- Fetch job --> DDB
+    EC -- Create & run --> cpp-sandbox
+    EC -- Upload output --> S3
+    EC -- Update status --> DDB
+
+    Client -- GET /status?id= --> GW
+    GW -- Read status --> DDB
+
+    Client -- GET /result?id= --> GW
+    GW -- Presign URL --> S3
+    GW -- Return download link --> Client
+
+    style GW fill:#4a90d9,color:#fff
+    style DDB fill:#f5a623,color:#000
+    style Q fill:#7ed321,color:#000
+    style S3 fill:#d0021b,color:#fff
+    style go-sandbox fill:#e8f5e9,stroke:#2e7d32
+    style cpp-sandbox fill:#e8f5e9,stroke:#2e7d32
+    style exec-go fill:#e3f2fd,stroke:#1565c0
+    style exec-cpp fill:#e3f2fd,stroke:#1565c0
+    style SG fill:#c8e6c9,stroke:#2e7d32
+    style SC fill:#c8e6c9,stroke:#2e7d32
 ```
 
 ## Troubleshooting
