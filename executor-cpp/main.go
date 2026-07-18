@@ -96,7 +96,7 @@ func main() {
 				continue
 			}
 			go func(m sqst.Message, jm jobMsg) {
-				if err := processJob(ctx, ddb, uploader, dockerClient, env.DynamoDBTable, env.CodeExecBucket, sandboxImage, jm, timeoutSec); err != nil {
+				if err := processJob(ctx, ddb, s3Client, uploader, dockerClient, env.DynamoDBTable, env.CodeExecBucket, sandboxImage, jm, timeoutSec); err != nil {
 					log.Printf("job %s failed: %v", jm.ExecutionID, err)
 				}
 				deleteMessage(ctx, sqsClient, env.SQSQueueURL, m)
@@ -118,6 +118,7 @@ func deleteMessage(ctx context.Context, client *sqs.Client, queueURL string, m s
 func processJob(
 	ctx context.Context,
 	ddb *dynamodb.Client,
+	s3Client *s3.Client,
 	uploader *manager.Uploader,
 	dockerClient *client.Client,
 	table, bucket, sandboxImage string,
@@ -134,7 +135,16 @@ func processJob(
 
 	start := time.Now()
 
-	codeTar, err := tarSource("main.cpp", job.Code)
+	code, err := store.DownloadPayload(ctx, s3Client, bucket, job.CodeS3Key)
+	if err != nil {
+		return fmt.Errorf("download code: %w", err)
+	}
+	input, err := store.DownloadPayload(ctx, s3Client, bucket, job.InputS3Key)
+	if err != nil {
+		return fmt.Errorf("download input: %w", err)
+	}
+
+	codeTar, err := tarSource("main.cpp", code)
 	if err != nil {
 		return fmt.Errorf("tar failed: %w", err)
 	}
@@ -198,8 +208,8 @@ func processJob(
 		return fmt.Errorf("start failed: %w", err)
 	}
 
-	if job.Input != "" {
-		attach.Conn.Write([]byte(job.Input))
+	if input != "" {
+		attach.Conn.Write([]byte(input))
 	}
 	attach.CloseWrite()
 

@@ -60,6 +60,7 @@ func (s *Server) routes() {
 	mux.HandleFunc("/submit", handlers.HandleSubmit(handlers.SubmitDeps{
 		Env:          s.env,
 		DDB:          s.ddb,
+		S3:           s.s3,
 		SQS:          s.sqs,
 		LangResolver: s.langResolver,
 	}))

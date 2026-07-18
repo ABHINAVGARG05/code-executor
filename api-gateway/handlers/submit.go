@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/google/uuid"
 
@@ -17,11 +18,11 @@ import (
 	"github.com/ABHINAVGARG05/rme/aws/shared/store"
 )
 
-// SubmitDeps contains dependencies for HandleSubmit
 type SubmitDeps struct {
-	Env *config.Env
-	DDB *dynamodb.Client
-	SQS *sqs.Client
+	Env          *config.Env
+	DDB          *dynamodb.Client
+	S3           *s3.Client
+	SQS          *sqs.Client
 	LangResolver languages.Resolver
 }
 
@@ -52,12 +53,25 @@ func HandleSubmit(deps SubmitDeps) http.HandlerFunc {
 			return
 		}
 
+		executionID := uuid.New().String()
+		codeS3Key := fmt.Sprintf("code/%s.txt", executionID)
+		inputS3Key := fmt.Sprintf("input/%s.txt", executionID)
+
+		if err := store.UploadPayload(r.Context(), deps.S3, deps.Env.CodeExecBucket, codeS3Key, req.Code); err != nil {
+			http.Error(w, "failed to upload code: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := store.UploadPayload(r.Context(), deps.S3, deps.Env.CodeExecBucket, inputS3Key, req.Input); err != nil {
+			http.Error(w, "failed to upload input: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
 		job := models.Job{
-			ExecutionID: uuid.New().String(),
+			ExecutionID: executionID,
 			UserID:      req.UserID,
 			Language:    req.Language,
-			Code:        req.Code,
-			Input:       req.Input,
+			CodeS3Key:   codeS3Key,
+			InputS3Key:  inputS3Key,
 			Status:      "queued",
 			CreatedAt:   time.Now().UTC().Format(time.RFC3339),
 		}
